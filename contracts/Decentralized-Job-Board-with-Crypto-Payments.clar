@@ -8,11 +8,15 @@
 (define-constant ERR-DISPUTE-EXPIRED (err u107))
 (define-constant ERR-CATEGORY-NOT-FOUND (err u108))
 (define-constant ERR-SKILL-NOT-FOUND (err u109))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u110))
+(define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u111))
+(define-constant ERR-INVALID-MILESTONE-STATUS (err u112))
 
 (define-data-var job-count uint u0)
 (define-data-var dispute-count uint u0)
 (define-data-var category-count uint u0)
 (define-data-var skill-count uint u0)
+(define-data-var milestone-count uint u0)
 
 (define-map Jobs 
     uint 
@@ -78,6 +82,24 @@
     (list 100 uint)
 )
 
+(define-map Milestones
+    uint
+    {
+        job-id: uint,
+        title: (string-ascii 100),
+        description: (string-ascii 300),
+        amount: uint,
+        status: (string-ascii 20),
+        created-at: uint,
+        completed-at: (optional uint)
+    }
+)
+
+(define-map JobMilestones
+    uint
+    (list 10 uint)
+)
+
 (define-public (create-category (name (string-ascii 50)) (description (string-ascii 200)))
     (let ((category-id (var-get category-count)))
         (map-set Categories category-id {name: name, description: description})
@@ -125,6 +147,7 @@
         (let ((current-jobs (default-to (list) (map-get? JobsByCategory category-id))))
             (map-set JobsByCategory category-id (unwrap-panic (as-max-len? (append current-jobs job-id) u100)))
         )
+        (map-set JobMilestones job-id (list))
         (var-set job-count (+ job-id u1))
         (ok job-id)
     )
@@ -232,6 +255,60 @@
     )
 )
 
+(define-public (create-milestone (job-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (amount uint))
+    (let 
+        (
+            (job (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND))
+            (milestone-id (var-get milestone-count))
+        )
+        (asserts! (is-eq tx-sender (get employer job)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status job) "open") ERR-INVALID-STATUS)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set Milestones milestone-id
+            {
+                job-id: job-id,
+                title: title,
+                description: description,
+                amount: amount,
+                status: "pending",
+                created-at: burn-block-height,
+                completed-at: none
+            }
+        )
+        (let ((current-milestones (default-to (list) (map-get? JobMilestones job-id))))
+            (map-set JobMilestones job-id (unwrap-panic (as-max-len? (append current-milestones milestone-id) u10)))
+        )
+        (var-set milestone-count (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (complete-milestone (milestone-id uint))
+    (let ((milestone (unwrap! (map-get? Milestones milestone-id) ERR-MILESTONE-NOT-FOUND)))
+        (let ((job (unwrap! (map-get? Jobs (get job-id milestone)) ERR-JOB-NOT-FOUND)))
+            (asserts! (is-eq (some tx-sender) (get worker job)) ERR-NOT-AUTHORIZED)
+            (asserts! (is-eq (get status milestone) "pending") ERR-INVALID-MILESTONE-STATUS)
+            (map-set Milestones milestone-id (merge milestone {
+                status: "completed",
+                completed-at: (some burn-block-height)
+            }))
+            (try! (as-contract (stx-transfer? (get amount milestone) tx-sender (unwrap-panic (get worker job)))))
+            (ok true)
+        )
+    )
+)
+
+(define-public (approve-milestone (milestone-id uint))
+    (let ((milestone (unwrap! (map-get? Milestones milestone-id) ERR-MILESTONE-NOT-FOUND)))
+        (let ((job (unwrap! (map-get? Jobs (get job-id milestone)) ERR-JOB-NOT-FOUND)))
+            (asserts! (is-eq tx-sender (get employer job)) ERR-NOT-AUTHORIZED)
+            (asserts! (is-eq (get status milestone) "completed") ERR-INVALID-MILESTONE-STATUS)
+            (map-set Milestones milestone-id (merge milestone {status: "approved"}))
+            (ok true)
+        )
+    )
+)
+
 (define-read-only (get-job (job-id uint))
     (ok (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND))
 )
@@ -261,6 +338,14 @@
         {rating: u0, jobs-completed: u0}
         (map-get? UserReputations user)
     )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (ok (unwrap! (map-get? Milestones milestone-id) ERR-MILESTONE-NOT-FOUND))
+)
+
+(define-read-only (get-job-milestones (job-id uint))
+    (ok (default-to (list) (map-get? JobMilestones job-id)))
 )
 
 (define-read-only (check-skill-match (applicant principal) (required-skills (list 5 uint)))
