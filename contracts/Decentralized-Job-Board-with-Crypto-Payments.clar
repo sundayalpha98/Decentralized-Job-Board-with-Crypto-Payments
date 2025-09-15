@@ -11,12 +11,15 @@
 (define-constant ERR-MILESTONE-NOT-FOUND (err u110))
 (define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u111))
 (define-constant ERR-INVALID-MILESTONE-STATUS (err u112))
+(define-constant ERR-AUTO-RELEASE-NOT-READY (err u113))
+(define-constant ERR-ALREADY-AUTO-RELEASED (err u114))
 
 (define-data-var job-count uint u0)
 (define-data-var dispute-count uint u0)
 (define-data-var category-count uint u0)
 (define-data-var skill-count uint u0)
 (define-data-var milestone-count uint u0)
+(define-data-var default-auto-release-blocks uint u1008)
 
 (define-map Jobs 
     uint 
@@ -29,7 +32,9 @@
         worker: (optional principal),
         created-at: uint,
         category-id: uint,
-        required-skills: (list 5 uint)
+        required-skills: (list 5 uint),
+        auto-release-deadline: (optional uint),
+        auto-released: bool
     }
 )
 
@@ -141,7 +146,9 @@
                 worker: none,
                 created-at: burn-block-height,
                 category-id: category-id,
-                required-skills: required-skills
+                required-skills: required-skills,
+                auto-release-deadline: none,
+                auto-released: false
             }
         )
         (let ((current-jobs (default-to (list) (map-get? JobsByCategory category-id))))
@@ -167,7 +174,8 @@
         (asserts! (is-eq (get status job) "open") ERR-INVALID-STATUS)
         (map-set Jobs job-id (merge job {
             status: "in-progress",
-            worker: (some worker)
+            worker: (some worker),
+            auto-release-deadline: (some (+ burn-block-height (var-get default-auto-release-blocks)))
         }))
         (ok true)
     )
@@ -309,6 +317,34 @@
     )
 )
 
+(define-public (trigger-auto-release (job-id uint))
+    (let ((job (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND)))
+        (asserts! (is-eq (get status job) "in-progress") ERR-INVALID-STATUS)
+        (asserts! (is-some (get auto-release-deadline job)) ERR-AUTO-RELEASE-NOT-READY)
+        (asserts! (>= burn-block-height (unwrap-panic (get auto-release-deadline job))) ERR-AUTO-RELEASE-NOT-READY)
+        (asserts! (not (get auto-released job)) ERR-ALREADY-AUTO-RELEASED)
+        (map-set Jobs job-id (merge job {
+            status: "completed",
+            auto-released: true
+        }))
+        (try! (as-contract (stx-transfer? (get payment job) tx-sender (unwrap-panic (get worker job)))))
+        (update-reputation (unwrap-panic (get worker job)))
+        (ok true)
+    )
+)
+
+(define-public (set-auto-release-period (job-id uint) (blocks uint))
+    (let ((job (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get employer job)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status job) "in-progress") ERR-INVALID-STATUS)
+        (asserts! (> blocks u0) ERR-INVALID-STATUS)
+        (map-set Jobs job-id (merge job {
+            auto-release-deadline: (some (+ burn-block-height blocks))
+        }))
+        (ok true)
+    )
+)
+
 (define-read-only (get-job (job-id uint))
     (ok (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND))
 )
@@ -350,6 +386,20 @@
 
 (define-read-only (check-skill-match (applicant principal) (required-skills (list 5 uint)))
     (ok (fold check-single-skill required-skills {user: applicant, matches: u0}))
+)
+
+(define-read-only (check-auto-release-ready (job-id uint))
+    (let ((job (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND)))
+        (ok {
+            ready: (and 
+                (is-some (get auto-release-deadline job))
+                (>= burn-block-height (unwrap-panic (get auto-release-deadline job)))
+                (not (get auto-released job))
+            ),
+            deadline: (get auto-release-deadline job),
+            current-block: burn-block-height
+        })
+    )
 )
 
 (define-private (check-single-skill (skill-id uint) (acc {user: principal, matches: uint}))
