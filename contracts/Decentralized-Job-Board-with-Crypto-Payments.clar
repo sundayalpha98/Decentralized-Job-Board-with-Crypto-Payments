@@ -13,6 +13,9 @@
 (define-constant ERR-INVALID-MILESTONE-STATUS (err u112))
 (define-constant ERR-AUTO-RELEASE-NOT-READY (err u113))
 (define-constant ERR-ALREADY-AUTO-RELEASED (err u114))
+(define-constant ERR-FEEDBACK-ALREADY-GIVEN (err u115))
+(define-constant ERR-JOB-NOT-COMPLETED (err u116))
+(define-constant ERR-INVALID-RATING (err u117))
 
 (define-data-var job-count uint u0)
 (define-data-var dispute-count uint u0)
@@ -20,6 +23,7 @@
 (define-data-var skill-count uint u0)
 (define-data-var milestone-count uint u0)
 (define-data-var default-auto-release-blocks uint u1008)
+(define-data-var feedback-count uint u0)
 
 (define-map Jobs 
     uint 
@@ -103,6 +107,23 @@
 (define-map JobMilestones
     uint
     (list 10 uint)
+)
+
+(define-map Feedbacks
+    uint
+    {
+        job-id: uint,
+        from-user: principal,
+        to-user: principal,
+        rating: uint,
+        comment: (string-ascii 300),
+        created-at: uint
+    }
+)
+
+(define-map JobFeedbacks
+    {job-id: uint, from-user: principal}
+    uint
 )
 
 (define-public (create-category (name (string-ascii 50)) (description (string-ascii 200)))
@@ -345,6 +366,36 @@
     )
 )
 
+(define-public (submit-feedback (job-id uint) (to-user principal) (rating uint) (comment (string-ascii 300)))
+    (let 
+        (
+            (job (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND))
+            (feedback-id (var-get feedback-count))
+        )
+        (asserts! (or (is-eq (get status job) "completed") (is-eq (get status job) "cancelled")) ERR-JOB-NOT-COMPLETED)
+        (asserts! (or 
+            (is-eq tx-sender (get employer job))
+            (is-eq (some tx-sender) (get worker job))
+        ) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (is-none (map-get? JobFeedbacks {job-id: job-id, from-user: tx-sender})) ERR-FEEDBACK-ALREADY-GIVEN)
+        (map-set Feedbacks feedback-id
+            {
+                job-id: job-id,
+                from-user: tx-sender,
+                to-user: to-user,
+                rating: rating,
+                comment: comment,
+                created-at: burn-block-height
+            }
+        )
+        (map-set JobFeedbacks {job-id: job-id, from-user: tx-sender} feedback-id)
+        (var-set feedback-count (+ feedback-id u1))
+        (update-user-rating to-user rating)
+        (ok feedback-id)
+    )
+)
+
 (define-read-only (get-job (job-id uint))
     (ok (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND))
 )
@@ -402,6 +453,28 @@
     )
 )
 
+(define-read-only (get-feedback (feedback-id uint))
+    (map-get? Feedbacks feedback-id)
+)
+
+(define-read-only (get-job-feedback (job-id uint) (from-user principal))
+    (let ((feedback-id (map-get? JobFeedbacks {job-id: job-id, from-user: from-user})))
+        (if (is-some feedback-id)
+            (map-get? Feedbacks (unwrap-panic feedback-id))
+            none
+        )
+    )
+)
+
+(define-read-only (get-user-average-rating (user principal))
+    (let ((reputation (get-user-reputation user)))
+        (if (> (get jobs-completed reputation) u0)
+            (ok (/ (get rating reputation) (get jobs-completed reputation)))
+            (ok u0)
+        )
+    )
+)
+
 (define-private (check-single-skill (skill-id uint) (acc {user: principal, matches: uint}))
     (let ((user-skill (map-get? UserSkills {user: (get user acc), skill-id: skill-id})))
         (if (and (is-some user-skill) (>= (get proficiency (unwrap-panic user-skill)) u3))
@@ -418,6 +491,18 @@
             {
                 rating: (+ (get rating current-rep) u1),
                 jobs-completed: (+ (get jobs-completed current-rep) u1)
+            }
+        )
+    )
+)
+
+(define-private (update-user-rating (user principal) (rating uint))
+    (let ((current-rep (get-user-reputation user)))
+        (map-set UserReputations 
+            user 
+            {
+                rating: (+ (get rating current-rep) rating),
+                jobs-completed: (get jobs-completed current-rep)
             }
         )
     )
