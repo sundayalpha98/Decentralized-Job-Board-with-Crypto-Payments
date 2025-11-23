@@ -16,6 +16,10 @@
 (define-constant ERR-FEEDBACK-ALREADY-GIVEN (err u115))
 (define-constant ERR-JOB-NOT-COMPLETED (err u116))
 (define-constant ERR-INVALID-RATING (err u117))
+(define-constant ERR-NOT-MEDIATOR (err u118))
+(define-constant ERR-MEDIATOR-ALREADY-ASSIGNED (err u119))
+(define-constant ERR-MEDIATOR-NOT-ASSIGNED (err u120))
+(define-constant ERR-INSUFFICIENT-MEDIATOR-FEE (err u121))
 
 (define-data-var job-count uint u0)
 (define-data-var dispute-count uint u0)
@@ -24,8 +28,10 @@
 (define-data-var milestone-count uint u0)
 (define-data-var default-auto-release-blocks uint u1008)
 (define-data-var feedback-count uint u0)
+(define-data-var mediator-count uint u0)
+(define-data-var default-mediator-fee uint u10000)
 
-(define-map Jobs 
+(define-map Jobs
     uint 
     {
         employer: principal,
@@ -124,6 +130,27 @@
 (define-map JobFeedbacks
     {job-id: uint, from-user: principal}
     uint
+)
+
+(define-map Mediators
+    principal
+    {
+        active: bool,
+        disputes-resolved: uint,
+        success-rate: uint,
+        fee: uint,
+        registered-at: uint
+    }
+)
+
+(define-map DisputeMediators
+    uint
+    {
+        mediator: principal,
+        assigned-at: uint,
+        resolved-at: (optional uint),
+        resolution: (optional (string-ascii 20))
+    }
 )
 
 (define-public (create-category (name (string-ascii 50)) (description (string-ascii 200)))
@@ -366,8 +393,93 @@
     )
 )
 
-(define-public (submit-feedback (job-id uint) (to-user principal) (rating uint) (comment (string-ascii 300)))
+(define-public (register-mediator (fee uint))
+    (begin
+        (asserts! (is-none (map-get? Mediators tx-sender)) ERR-INVALID-STATUS)
+        (map-set Mediators tx-sender
+            {
+                active: true,
+                disputes-resolved: u0,
+                success-rate: u100,
+                fee: fee,
+                registered-at: burn-block-height
+            }
+        )
+        (var-set mediator-count (+ (var-get mediator-count) u1))
+        (ok true)
+    )
+)
+
+(define-public (update-mediator-status (active bool))
+    (let ((mediator (unwrap! (map-get? Mediators tx-sender) ERR-NOT-MEDIATOR)))
+        (map-set Mediators tx-sender (merge mediator {active: active}))
+        (ok true)
+    )
+)
+
+(define-public (assign-mediator (dispute-id uint) (mediator principal))
     (let 
+        (
+            (dispute (unwrap! (map-get? Disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+            (mediator-data (unwrap! (map-get? Mediators mediator) ERR-NOT-MEDIATOR))
+            (job (unwrap! (map-get? Jobs (get job-id dispute)) ERR-JOB-NOT-FOUND))
+        )
+        (asserts! (get active mediator-data) ERR-NOT-MEDIATOR)
+        (asserts! (is-eq (get status dispute) "active") ERR-INVALID-STATUS)
+        (asserts! (is-none (map-get? DisputeMediators dispute-id)) ERR-MEDIATOR-ALREADY-ASSIGNED)
+        (asserts! (or 
+            (is-eq tx-sender (get employer job))
+            (is-eq (some tx-sender) (get worker job))
+        ) ERR-NOT-AUTHORIZED)
+        (try! (stx-transfer? (get fee mediator-data) tx-sender (as-contract tx-sender)))
+        (map-set DisputeMediators dispute-id
+            {
+                mediator: mediator,
+                assigned-at: burn-block-height,
+                resolved-at: none,
+                resolution: none
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute-as-mediator (dispute-id uint) (favor (string-ascii 20)))
+    (let 
+        (
+            (dispute (unwrap! (map-get? Disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+            (mediator-assignment (unwrap! (map-get? DisputeMediators dispute-id) ERR-MEDIATOR-NOT-ASSIGNED))
+            (mediator-data (unwrap! (map-get? Mediators tx-sender) ERR-NOT-MEDIATOR))
+            (job (unwrap! (map-get? Jobs (get job-id dispute)) ERR-JOB-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender (get mediator mediator-assignment)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status dispute) "active") ERR-INVALID-STATUS)
+        (map-set Disputes dispute-id (merge dispute {status: "resolved"}))
+        (map-set DisputeMediators dispute-id (merge mediator-assignment {
+            resolved-at: (some burn-block-height),
+            resolution: (some favor)
+        }))
+        (if (is-eq favor "worker")
+            (begin
+                (try! (as-contract (stx-transfer? (get payment job) tx-sender (unwrap-panic (get worker job)))))
+                (map-set Jobs (get job-id dispute) (merge job {status: "completed"}))
+                (update-reputation (unwrap-panic (get worker job)))
+            )
+            (begin
+                (try! (as-contract (stx-transfer? (get payment job) tx-sender (get employer job))))
+                (map-set Jobs (get job-id dispute) (merge job {status: "cancelled"}))
+            )
+        )
+        (try! (as-contract (stx-transfer? (get fee mediator-data) tx-sender tx-sender)))
+        (map-set Mediators tx-sender (merge mediator-data {
+            disputes-resolved: (+ (get disputes-resolved mediator-data) u1)
+        }))
+        (ok true)
+    )
+)
+
+(define-public (submit-feedback (job-id uint) (to-user principal) (rating uint) (comment (string-ascii 300)))
+    (let
         (
             (job (unwrap! (map-get? Jobs job-id) ERR-JOB-NOT-FOUND))
             (feedback-id (var-get feedback-count))
@@ -473,6 +585,18 @@
             (ok u0)
         )
     )
+)
+
+(define-read-only (get-mediator (mediator principal))
+    (ok (map-get? Mediators mediator))
+)
+
+(define-read-only (get-dispute-mediator (dispute-id uint))
+    (ok (map-get? DisputeMediators dispute-id))
+)
+
+(define-read-only (get-mediator-count)
+    (ok (var-get mediator-count))
 )
 
 (define-private (check-single-skill (skill-id uint) (acc {user: principal, matches: uint}))
